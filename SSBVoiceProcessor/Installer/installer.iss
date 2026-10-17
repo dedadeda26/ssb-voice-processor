@@ -31,7 +31,6 @@ WizardResizable=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
-PrivilegesRequiredOverridesAllowed=dialog
 ShowLanguageDialog=no
 SetupIconFile=../Resources/icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
@@ -64,7 +63,9 @@ Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
+; 程序清单要求管理员权限，直接 CreateProcess 会返回 740（请求的操作需要提升），
+; 所以这里交给 Shell 去启动（shellexec），让 UAC 正常弹窗。
+Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent shellexec
 
 [UninstallDelete]
 ; 卸载时清理安装目录（防止运行过程中生成的缓存残留）
