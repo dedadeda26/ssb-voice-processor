@@ -16,6 +16,7 @@ AppPublisher={#MyAppPublisher}
 AppComments=make SSB hifi again - by BI4AGE
 VersionInfoCompany=BI4AGE
 VersionInfoDescription=SSB Voice Processor Setup - make SSB hifi again
+VersionInfoVersion=0.1.0.0
 VersionInfoCopyright=(c) BI4AGE
 DefaultDirName={autopf}\SSBVoiceProcessor
 DefaultGroupName={#MyAppName}

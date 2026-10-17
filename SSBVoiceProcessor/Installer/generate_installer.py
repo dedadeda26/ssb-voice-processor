@@ -219,6 +219,7 @@ AppPublisher={{#MyAppPublisher}}
 AppComments=make SSB hifi again - by BI4AGE
 VersionInfoCompany={APP_PUBLISHER}
 VersionInfoDescription={APP_NAME} Setup - make SSB hifi again
+VersionInfoVersion={APP_VERSION}.0
 VersionInfoCopyright=(c) BI4AGE
 DefaultDirName={{autopf}}\\SSBVoiceProcessor
 DefaultGroupName={{#MyAppName}}
