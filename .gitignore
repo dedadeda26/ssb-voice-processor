@@ -1,0 +1,36 @@
+# Local audit tooling, caches and original archives
+/audit/
+/*.rar
+/*.zip
+/??????.md
+/?????????.md
+/P2???????.md
+
+# Generated builds and platform metadata
+**/build/
+**/build-*/
+**/cmake-build-*/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/*_artefacts/
+**/Installer/output/
+**/Installer/Output/
+.DS_Store
+.vs/
+.idea/
+*.user
+*.suo
+*.dSYM/
+__pycache__/
+*.pyc
+
+# Runtime state
+*.settings
+*.log
+
+# Local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key

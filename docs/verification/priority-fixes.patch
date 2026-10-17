@@ -1,0 +1,1217 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -96,4 +96,42 @@
+     juce::juce_gui_extra
+     juce::juce_recommended_config_flags
+     juce::juce_recommended_warning_flags
+-)+)
++
++option(SSB_BUILD_TESTS "Build offline regression tests" OFF)
++if(SSB_BUILD_TESTS)
++    enable_testing()
++    find_package(Threads REQUIRED)
++    add_executable(ssb_display_queue_tests Tests/DisplayQueueTests.cpp)
++    target_include_directories(ssb_display_queue_tests PRIVATE Source)
++    target_link_libraries(ssb_display_queue_tests PRIVATE Threads::Threads)
++    add_test(NAME display_queue COMMAND ssb_display_queue_tests)
++
++    juce_add_console_app(ssb_priority_tests PRODUCT_NAME "SSB Priority Tests")
++    target_sources(ssb_priority_tests PRIVATE
++        Tests/PriorityFixes.cpp
++        Source/AudioEngine.cpp
++        Source/AutoCalibrator.cpp
++        Source/CalibrationOverlay.cpp
++        Source/Nodes/InputGainNode.cpp
++        Source/Nodes/HighPassNode.cpp
++        Source/Nodes/NoiseGateNode.cpp
++        Source/Nodes/EqNode.cpp
++        Source/Nodes/MultiBandCompNode.cpp
++        Source/Nodes/CompressorNode.cpp
++        Source/Nodes/SaturationNode.cpp
++        Source/Nodes/DeEsserNode.cpp
++        Source/Nodes/LimiterNode.cpp
++        Source/Nodes/BandLimitNode.cpp
++        Source/Nodes/OutputGainNode.cpp
++    )
++    target_include_directories(ssb_priority_tests PRIVATE Source)
++    target_compile_definitions(ssb_priority_tests PRIVATE
++        JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_MODAL_LOOPS_PERMITTED=1)
++    target_link_libraries(ssb_priority_tests PRIVATE
++        juce::juce_audio_devices juce::juce_dsp juce::juce_gui_basics)
++    if(MSVC)
++        target_compile_options(ssb_priority_tests PRIVATE /utf-8)
++    endif()
++    add_test(NAME priority_fixes COMMAND ssb_priority_tests)
++endif()
+--- a/README.md
++++ b/README.md
+@@ -5,3 +5,20 @@
+ 构建：
+     cmake -B build -G "Visual Studio 18 2026" -A x64 -DJUCE_DIR=D:/Dev/JUCE
+     cmake --build build --config Release
++
++优先问题修复后，处理链末端为 Band-Limit → Output Gain → Limiter。
++启用 Limiter 时按所设阈值限制最终样本峰值；总旁路或 Limiter 旁路时，
++仍保留 0 dBFS 样本峰值保护，超限信号会被截断。此保护不等同于 true-peak 限幅。
++
++自动校准支持“取消 / Cancel”按钮和 Esc；无有效输入/输出设备时拒绝开始，
++采集中连续 2 秒无数据或超过目标时长加 3 秒时退出并显示失败原因。
++
++离线回归测试（不打开真实声卡）：
++
++    cmake -B build-tests -DJUCE_DIR=D:/Dev/JUCE -DSSB_BUILD_TESTS=ON
++    cmake --build build-tests --config Debug
++    ctest --test-dir build-tests -C Debug --output-on-failure
++
++测试覆盖多段分频合成响应、输出增益后限幅、旁路保护、校准失败和取消、
++显示队列满载恢复和并发传递。Tests/DisplayQueueTests.cpp 也可以用 Clang
++单独加 -fsanitize=thread 编译，检查显示数据传递中的数据竞争。
+--- a/Source/AudioEngine.cpp
++++ b/Source/AudioEngine.cpp
+@@ -12,7 +12,7 @@
+ #include "Nodes/OutputGainNode.h"
+ #include <cmath>
+ 
+-AudioEngine::AudioEngine()
++AudioEngine::AudioEngine(bool openDevices)
+ {
+     addNode(std::make_unique<InputGainNode>());
+     addNode(std::make_unique<HighPassNode>());
+@@ -22,18 +22,17 @@
+     addNode(std::make_unique<CompressorNode>());
+     addNode(std::make_unique<SaturationNode>());
+     addNode(std::make_unique<DeEsserNode>());
+-    addNode(std::make_unique<LimiterNode>());
+     addNode(std::make_unique<BandLimitNode>());
+     addNode(std::make_unique<OutputGainNode>());
+-
+-    waveBuffer.fill(0.0f);
+-    smoothedWave.fill(0.0f);
++    // The configurable limiter must see the final filtered and amplified signal.
++    addNode(std::make_unique<LimiterNode>());
++
+     fftData.fill(0.0f);
+     fftMags.fill(0.0f);
+-    spectrumBands.fill(0.0f);
+     spectrumSmooth.fill(0.0f);
+-    for (auto& h : spectrumHistory) h.fill(0.0f);
+     captureBuffer.setSize(1, 48000 * 10, false, true, true);
++
++    if (!openDevices) return; // Offline processing and deterministic tests.
+ 
+     auto err = deviceManager.initialiseWithDefaultDevices(1, 2);
+     if (err.isNotEmpty())
+@@ -53,37 +52,44 @@
+     currentSampleRate = device->getCurrentSampleRate();
+     currentBlockSize  = device->getCurrentBufferSizeSamples();
+     monoBuffer.setSize(1, currentBlockSize, false, true, true);
+-    for (auto& n : nodes) n->prepare(currentSampleRate, currentBlockSize);
+-}
+-void AudioEngine::audioDeviceStopped() { for (auto& n : nodes) n->reset(); }
+-
+-void AudioEngine::startCapture(int targetSamples)
+-{
+-    if (targetSamples <= 0) return;
++    fftHop = 0;
++    for (auto& n : nodes) { n->reset(); n->prepare(currentSampleRate.load(), currentBlockSize); }
++    captureReady.store(device->getActiveInputChannels().countNumberOfSetBits() > 0
++                       && device->getActiveOutputChannels().countNumberOfSetBits() > 0
++                       && currentSampleRate.load() > 0.0);
++}
++void AudioEngine::audioDeviceStopped()
++{
++    captureReady.store(false);
++    capturing.store(false);
++    for (auto& n : nodes) n->reset();
++}
++
++void AudioEngine::audioDeviceError(const juce::String&)
++{
++    captureReady.store(false);
++    capturing.store(false);
++}
++
++bool AudioEngine::startCapture(int targetSamples)
++{
++    // The manager holds this lock during callbacks. Only the control thread
++    // acquires it here, so resize/clear cannot race an in-flight capture copy.
++    const juce::ScopedLock lock(deviceManager.getAudioCallbackLock());
++    if (targetSamples <= 0 || !captureReady.load() || capturing.load()) return false;
+     if (captureBuffer.getNumSamples() < targetSamples)
+         captureBuffer.setSize(1, targetSamples, false, true, true);
+     captureBuffer.clear();
+     captureTarget = targetSamples;
+     captureWritePos.store(0);
+     capturing.store(true);
+-}
+-void AudioEngine::stopCapture() { capturing.store(false); }
+-
+-// 平滑包络：快升慢降，只对最末尾 newSamples 个样本做处理，性能好
+-void AudioEngine::updateSmoothedWave(int newSamples)
+-{
+-    if (newSamples <= 0) return;
+-    int wp = waveWritePos.load();
+-    int start = (wp - newSamples + kWaveSize * 2) % kWaveSize;
+-    for (int k = 0; k < newSamples; ++k)
+-    {
+-        int i = (start + k) % kWaveSize;
+-        float target = waveBuffer[(size_t) i];
+-        float prev = smoothedWave[(size_t) i];
+-        float delta = target - prev;
+-        float coef = (std::abs(target) > std::abs(prev)) ? 0.55f : 0.08f;
+-        smoothedWave[(size_t) i] = prev + delta * coef;
+-    }
++    return true;
++}
++
++void AudioEngine::stopCapture()
++{
++    const juce::ScopedLock lock(deviceManager.getAudioCallbackLock());
++    capturing.store(false);
+ }
+ 
+ void AudioEngine::pushFFT(const float* data, int numSamples)
+@@ -126,16 +132,9 @@
+             float avg = sum / (float)(i2 - i1);
+             float prev = spectrumSmooth[(size_t) b];
+             spectrumSmooth[(size_t) b] = avg > prev ? avg : prev * 0.85f + avg * 0.15f;
+-            spectrumBands[(size_t) b] = spectrumSmooth[(size_t) b];
+-        }
+-
+-        {
+-            int wp = spectrumWritePos.load();
+-            for (int b = 0; b < kSpecBands; ++b)
+-                spectrumHistory[(size_t) wp][(size_t) b] = spectrumBands[(size_t) b];
+-            wp = (wp + 1) % kSpecHistory;
+-            spectrumWritePos.store(wp);
+-        }
++        }
++
++        visualization.pushSpectrum(spectrumSmooth);
+ 
+         fftHop = 0;
+         std::fill(fftData.begin(), fftData.end(), 0.0f);
+@@ -151,7 +150,7 @@
+         if (outputChannelData[ch] != nullptr)
+             juce::FloatVectorOperations::clear(outputChannelData[ch], numSamples);
+ 
+-    if (numInputChannels == 0 || numOutputChannels == 0) return;
++    if (numSamples <= 0 || numInputChannels == 0 || numOutputChannels == 0) return;
+     if (inputChannelData == nullptr || inputChannelData[0] == nullptr) return;
+ 
+     if (monoBuffer.getNumSamples() < numSamples)
+@@ -193,6 +192,11 @@
+     if (!bypass.load())
+         for (auto& n : nodes) n->process(work, numSamples);
+ 
++    // Always retain the device's 0 dBFS sample-peak safety boundary, including
++    // global or per-module bypass. Normal limiting uses the last node's ceiling.
++    for (int i = 0; i < numSamples; ++i)
++        work[i] = std::isfinite(work[i]) ? juce::jlimit(-1.0f, 1.0f, work[i]) : 0.0f;
++
+     {
+         float peak = 0.0f, sum = 0.0f;
+         for (int i = 0; i < numSamples; ++i)
+@@ -208,17 +212,7 @@
+         outRms.store(juce::jmax(rms, prev * 0.92f));
+     }
+ 
+-    {
+-        int wp = waveWritePos.load();
+-        for (int i = 0; i < numSamples; ++i)
+-        {
+-            waveBuffer[(size_t) wp] = work[i];
+-            wp = (wp + 1) % kWaveSize;
+-        }
+-        waveWritePos.store(wp);
+-    }
+-
+-    updateSmoothedWave(numSamples);
++    visualization.pushWave(work, numSamples);
+     pushFFT(work, numSamples);
+ 
+     for (int ch = 0; ch < numOutputChannels; ++ch)
+--- a/Source/AudioEngine.h
++++ b/Source/AudioEngine.h
+@@ -6,17 +6,18 @@
+ #include <vector>
+ #include <array>
+ #include "DspNode.h"
++#include "VisualizationData.h"
+ 
+ class AudioEngine : public juce::AudioIODeviceCallback
+ {
+ public:
+-    static constexpr int kWaveSize = 131072;
++    static constexpr int kWaveSize = VisualizationData::waveSize;
+     static constexpr int kFFTOrder = 10;
+     static constexpr int kFFTSize  = 1 << kFFTOrder;
+-    static constexpr int kSpecBands = 96;
+-    static constexpr int kSpecHistory = 480;
++    static constexpr int kSpecBands = VisualizationData::bands;
++    static constexpr int kSpecHistory = VisualizationData::historySize;
+ 
+-    AudioEngine();
++    explicit AudioEngine(bool openDevices = true);
+     ~AudioEngine() override;
+ 
+     juce::AudioDeviceManager& getDeviceManager() { return deviceManager; }
+@@ -31,35 +32,16 @@
+     float getOutputLevel() const { return outLevel.load(); }
+     float getOutputRms()   const { return outRms.load(); }
+ 
+-    float getSpectrumBand(int i) const
+-    {
+-        if (i < 0 || i >= kSpecBands) return 0.0f;
+-        return spectrumBands[(size_t) i];
+-    }
++    // Display access belongs exclusively to the message thread.
++    void consumeVisualization() { visualization.consume(); }
++    float getSpectrumBand(int i) const { return visualization.getSpectrumBand(i); }
+     int getSpectrumBands() const { return kSpecBands; }
+-
+     int getSpectrumHistorySize() const { return kSpecHistory; }
+-    int getSpectrumWritePos() const { return spectrumWritePos.load(); }
+-    float getSpectrumHistory(int timeIdx, int band) const
+-    {
+-        if (band < 0 || band >= kSpecBands) return 0.0f;
+-        if (timeIdx < 0) timeIdx = 0;
+-        if (timeIdx >= kSpecHistory) timeIdx = kSpecHistory - 1;
+-        return spectrumHistory[(size_t) timeIdx][(size_t) band];
+-    }
+-
+-    float getWaveSample(int i) const
+-    {
+-        if (i < 0 || i >= kWaveSize) return 0.0f;
+-        return waveBuffer[(size_t) i];
+-    }
+-    int getWaveWritePos() const { return waveWritePos.load(); }
+-
+-    float getSmoothedWaveSample(int i) const
+-    {
+-        if (i < 0 || i >= kWaveSize) return 0.0f;
+-        return smoothedWave[(size_t) i];
+-    }
++    int getSpectrumWritePos() const { return visualization.getSpectrumWritePos(); }
++    float getSpectrumHistory(int time, int band) const { return visualization.getSpectrumHistory(time, band); }
++    float getWaveSample(int i) const { return visualization.getWaveSample(i); }
++    int getWaveWritePos() const { return visualization.getWaveWritePos(); }
++    float getSmoothedWaveSample(int i) const { return visualization.getSmoothedWaveSample(i); }
+ 
+     void audioDeviceIOCallbackWithContext(
+         const float* const* inputChannelData, int numInputChannels,
+@@ -67,20 +49,23 @@
+         const juce::AudioIODeviceCallbackContext&) override;
+     void audioDeviceAboutToStart(juce::AudioIODevice* device) override;
+     void audioDeviceStopped() override;
++    void audioDeviceError(const juce::String&) override;
+ 
+-    void startCapture(int targetSamples);
++    bool startCapture(int targetSamples);
++    bool isCaptureReady() const { return captureReady.load(); }
+     void stopCapture();
+     bool isCapturing() const { return capturing.load(); }
+     int getCapturedSamples() const { return captureWritePos.load(); }
+     const juce::AudioBuffer<float>& getCaptureBuffer() const { return captureBuffer; }
+-    double getCurrentSampleRate() const { return currentSampleRate; }
++    double getCurrentSampleRate() const { return currentSampleRate.load(); }
+ 
+ private:
+     juce::AudioDeviceManager deviceManager;
+     std::vector<std::unique_ptr<DspNode>> nodes;
+     std::atomic<bool> bypass { false };
+     juce::AudioBuffer<float> monoBuffer;
+-    double currentSampleRate = 48000.0;
++    std::atomic<double> currentSampleRate { 48000.0 };
++    std::atomic<bool> captureReady { false };
+     int currentBlockSize = 512;
+ 
+     std::atomic<float> inLevel { 0.0f };
+@@ -88,19 +73,13 @@
+     std::atomic<float> outLevel { 0.0f };
+     std::atomic<float> outRms   { 0.0f };
+ 
+-    std::array<float, kWaveSize> waveBuffer {};
+-    std::array<float, kWaveSize> smoothedWave {};
+-    std::atomic<int> waveWritePos { 0 };
++    VisualizationData visualization;
+ 
+     juce::dsp::FFT fft { kFFTOrder };
+     std::array<float, kFFTSize * 2> fftData {};
+     std::array<float, kFFTSize / 2> fftMags {};
+-    std::array<float, kSpecBands> spectrumBands {};
+     std::array<float, kSpecBands> spectrumSmooth {};
+     int fftHop = 0;
+-
+-    std::array<std::array<float, kSpecBands>, kSpecHistory> spectrumHistory {};
+-    std::atomic<int> spectrumWritePos { 0 };
+ 
+     juce::AudioBuffer<float> captureBuffer;
+     std::atomic<bool> capturing { false };
+@@ -108,5 +87,4 @@
+     int captureTarget = 0;
+ 
+     void pushFFT(const float* data, int numSamples);
+-    void updateSmoothedWave(int newSamples);
+ };
+--- a/Source/AutoCalibrator.cpp
++++ b/Source/AutoCalibrator.cpp
+@@ -1,17 +1,33 @@
+ ﻿#include "AutoCalibrator.h"
+ #include <algorithm>
+ #include <vector>
++#include <limits>
+ 
+-AutoCalibrator::AutoCalibrator(AudioEngine& e) : engine(e) {}
+-AutoCalibrator::~AutoCalibrator() { stopTimer(); }
++AutoCalibrator::AutoCalibrator(AudioEngine& e, std::function<double()> clock)
++    : engine(e), now(clock ? std::move(clock) : [] { return juce::Time::getMillisecondCounterHiRes(); }) {}
++AutoCalibrator::~AutoCalibrator() { stopTimer(); engine.stopCapture(); }
+ 
+ void AutoCalibrator::start(double seconds)
+ {
+     if (running) return;
+     double sr = engine.getCurrentSampleRate();
++    if (!std::isfinite(seconds) || seconds <= 0.0 || !std::isfinite(sr) || sr <= 0.0
++        || sr * seconds > static_cast<double>(std::numeric_limits<int>::max())
++        || !engine.isCaptureReady())
++    {
++        finish(Result::failed, juce::String::fromUTF8(u8"校准失败：请先连接并启用音频输入和输出设备"));
++        return;
++    }
+     targetSamples = (int)(sr * seconds);
+-    engine.startCapture(targetSamples);
++    if (!engine.startCapture(targetSamples))
++    {
++        finish(Result::failed, juce::String::fromUTF8(u8"校准失败：无法开始音频采集"));
++        return;
++    }
+     running = true;
++    startedAt = lastSamplesAt = now();
++    deadlineMs = seconds * 1000.0 + 3000.0;
++    lastSampleCount = 0;
+     lastStage = -1;
+     startTimerHz(30);
+     if (onProgress) onProgress(0.0f);
+@@ -22,16 +38,38 @@
+ void AutoCalibrator::cancel()
+ {
+     if (!running) return;
++    finish(Result::cancelled, juce::String::fromUTF8(u8"已取消校准，保留当前参数"));
++}
++
++void AutoCalibrator::finish(Result result, const juce::String& message)
++{
+     stopTimer();
+     engine.stopCapture();
+     running = false;
+-    if (onComplete) onComplete();
++    if (onStage) onStage(result == Result::succeeded ? 3 : 4, message);
++    if (onFinished) onFinished(result, message);
+ }
+ 
+ void AutoCalibrator::timerCallback()
+ {
+     if (!running) return;
+     int cur = engine.getCapturedSamples();
++    const double time = now();
++    if (!engine.isCaptureReady())
++    {
++        finish(Result::failed, juce::String::fromUTF8(u8"校准失败：音频设备已停止或断开"));
++        return;
++    }
++    if (cur != lastSampleCount)
++    {
++        lastSampleCount = cur;
++        lastSamplesAt = time;
++    }
++    if (cur < targetSamples && (time - lastSamplesAt >= 2000.0 || time - startedAt >= deadlineMs))
++    {
++        finish(Result::failed, juce::String::fromUTF8(u8"校准失败：音频采集超时，请检查设备"));
++        return;
++    }
+     float progress = targetSamples > 0 ? (float)cur / (float)targetSamples : 1.0f;
+     progress = juce::jlimit(0.0f, 1.0f, progress);
+     if (onProgress) onProgress(progress);
+@@ -46,14 +84,19 @@
+                 : juce::String::fromUTF8(u8"正在分析频谱…"));
+     }
+ 
+-    if (!engine.isCapturing() || cur >= targetSamples)
++    if (cur >= targetSamples)
+     {
+         stopTimer();
+-        running = false;
++        engine.stopCapture();
+         if (onStage) onStage(2, juce::String::fromUTF8(u8"正在应用参数…"));
+-        analyzeAndApply();
+-        if (onStage) onStage(3, juce::String::fromUTF8(u8"校准完成"));
+-        if (onComplete) onComplete();
++        if (analyzeAndApply())
++            finish(Result::succeeded, juce::String::fromUTF8(u8"校准完成"));
++        else
++            finish(Result::failed, juce::String::fromUTF8(u8"校准失败：有效采样不足"));
++    }
++    else if (!engine.isCapturing())
++    {
++        finish(Result::failed, juce::String::fromUTF8(u8"校准失败：音频采集提前结束"));
+     }
+ }
+ 
+@@ -66,11 +109,11 @@
+     }
+ }
+ 
+-void AutoCalibrator::analyzeAndApply()
++bool AutoCalibrator::analyzeAndApply()
+ {
+     auto& buf = engine.getCaptureBuffer();
+     int n = engine.getCapturedSamples();
+-    if (n < 4096) return;
++    if (n < 4096) return false;
+     const float* data = buf.getReadPointer(0);
+ 
+     const int frameSize = 960;
+@@ -133,4 +176,5 @@
+     setParam("Output Gain", "outGain", -2.0f);
+ 
+     engine.stopCapture();
++    return true;
+ }
+--- a/Source/AutoCalibrator.h
++++ b/Source/AutoCalibrator.h
+@@ -6,7 +6,8 @@
+ class AutoCalibrator : private juce::Timer
+ {
+ public:
+-    explicit AutoCalibrator(AudioEngine& engine);
++    enum class Result { succeeded, cancelled, failed };
++    explicit AutoCalibrator(AudioEngine& engine, std::function<double()> clock = {});
+     ~AutoCalibrator() override;
+ 
+     void start(double seconds = 8.0);
+@@ -15,14 +16,20 @@
+ 
+     std::function<void(float)> onProgress;
+     std::function<void(int, const juce::String&)> onStage;
+-    std::function<void()> onComplete;
++    std::function<void(Result, const juce::String&)> onFinished;
+ 
+ private:
+     void timerCallback() override;
+-    void analyzeAndApply();
++    bool analyzeAndApply();
++    void finish(Result result, const juce::String& message);
+ 
+     AudioEngine& engine;
+     bool running = false;
+     int targetSamples = 0;
+     int lastStage = -1;
++    std::function<double()> now;
++    double startedAt = 0.0;
++    double lastSamplesAt = 0.0;
++    double deadlineMs = 0.0;
++    int lastSampleCount = 0;
+ };
+--- a/Source/CalibrationOverlay.cpp
++++ b/Source/CalibrationOverlay.cpp
+@@ -4,7 +4,11 @@
+ 
+ CalibrationOverlay::CalibrationOverlay()
+ {
+-    setInterceptsMouseClicks(true, false);
++    setInterceptsMouseClicks(true, true);
++    setWantsKeyboardFocus(true);
++    cancelButton.setButtonText(juce::String::fromUTF8(u8"取消 / Cancel (Esc)"));
++    cancelButton.onClick = [this] { if (onCancel) onCancel(); };
++    addAndMakeVisible(cancelButton);
+     startTimerHz(60);
+ 
+     auroras = {
+@@ -21,6 +25,21 @@
+     };
+ }
+ 
++void CalibrationOverlay::resized()
++{
++    cancelButton.setBounds(getWidth() / 2 - 100, getHeight() - 62, 200, 36);
++}
++
++bool CalibrationOverlay::keyPressed(const juce::KeyPress& key)
++{
++    if (key == juce::KeyPress::escapeKey && cancelButton.isEnabled())
++    {
++        if (onCancel) onCancel();
++        return true;
++    }
++    return false;
++}
++
+ void CalibrationOverlay::timerCallback()
+ {
+     t1 += 0.06f;
+@@ -55,8 +74,9 @@
+     g.fillRect(r);
+ 
+     // 球体中心 / 半径
+-    auto centre = juce::Point<float>(r.getCentreX(), r.getCentreY() - 30.0f);
+-    float sphereR = juce::jmin(r.getWidth(), r.getHeight()) * 0.17f;
++    const auto content = r.withTrimmedBottom(100.0f);
++    auto centre = juce::Point<float>(content.getCentreX(), content.getCentreY() - 30.0f);
++    float sphereR = juce::jmin(content.getWidth(), content.getHeight()) * 0.17f;
+     if (sphereR < 100.0f) sphereR = 100.0f;
+ 
+     // 音频驱动的发光强度
+@@ -186,7 +206,7 @@
+     }
+ 
+     // 步骤文字
+-    float textTop = centre.y + sphereR + 70.0f;
++    float textTop = juce::jmin(centre.y + sphereR + 50.0f, r.getBottom() - 270.0f);
+     {
+         auto stageArea = juce::Rectangle<float>(
+             r.getX(), textTop, r.getWidth(), 32.0f);
+@@ -242,7 +262,7 @@
+     // 底部提示
+     {
+         auto tipArea = juce::Rectangle<float>(
+-            r.getX(), r.getBottom() - 60.0f, r.getWidth(), 30.0f);
++            r.getX(), r.getBottom() - 100.0f, r.getWidth(), 30.0f);
+         g.setColour(juce::Colour(0xff8896ac));
+         g.setFont(juce::Font(juce::FontOptions(13.0f)));
+         g.drawText(juce::String::fromUTF8(u8"请保持安静，正常说话 8 秒"),
+--- a/Source/CalibrationOverlay.h
++++ b/Source/CalibrationOverlay.h
+@@ -20,11 +20,16 @@
+ 
+     // 实时音频电平回调（0-1）
+     std::function<float()> levelGetter;
++    std::function<void()> onCancel;
++    void setCancelEnabled(bool enabled) { cancelButton.setEnabled(enabled); }
+ 
+     void paint(juce::Graphics&) override;
++    void resized() override;
++    bool keyPressed(const juce::KeyPress&) override;
+ 
+ private:
+     void timerCallback() override;
++    juce::TextButton cancelButton;
+ 
+     float progress = 0.0f;
+     int stageIndex = 0;
+--- a/Source/MainComponent.cpp
++++ b/Source/MainComponent.cpp
+@@ -50,13 +50,19 @@
+     autoCalibrator->onStage = [this](int idx, const juce::String& text) {
+         if (calibOverlay) calibOverlay->setStage(idx, text);
+     };
+-    autoCalibrator->onComplete = [this] {
++    autoCalibrator->onFinished = [this](AutoCalibrator::Result result, const juce::String& message) {
+         autoCalibBtn.setButtonText(Loc::t("toolbar.autocal"));
+-        if (calibOverlay) calibOverlay->setProgress(1.0f);
++        statusLabel.setText(message, juce::dontSendNotification);
++        if (calibOverlay) {
++            calibOverlay->setCancelEnabled(false);
++            if (result == AutoCalibrator::Result::succeeded) calibOverlay->setProgress(1.0f);
++        }
+ 
+         juce::Component::SafePointer<MainComponent> safe(this);
+-        juce::Timer::callAfterDelay(700, [safe]() {
+-            if (safe == nullptr) return;
++        const auto generation = calibrationGeneration;
++        // Defer destruction so the cancel button's own callback can return.
++        juce::Timer::callAfterDelay(result == AutoCalibrator::Result::succeeded ? 700 : 1, [safe, generation]() {
++            if (safe == nullptr || safe->calibrationGeneration != generation) return;
+             if (safe->calibOverlay) {
+                 safe->removeChildComponent(safe->calibOverlay.get());
+                 safe->calibOverlay.reset();
+@@ -441,14 +447,16 @@
+ {
+     if (autoCalibrator->isRunning()) {
+         autoCalibrator->cancel();
+-        if (calibOverlay) { removeChildComponent(calibOverlay.get()); calibOverlay.reset(); }
+         return;
+     }
++    ++calibrationGeneration;
+     calibOverlay = std::make_unique<CalibrationOverlay>();
+     calibOverlay->levelGetter = [this]() { return audioEngine.getInputLevel(); };
++    calibOverlay->onCancel = [this]() { autoCalibrator->cancel(); };
+     addAndMakeVisible(calibOverlay.get());
+     calibOverlay->setBounds(getLocalBounds());
+     calibOverlay->toFront(true);
++    calibOverlay->grabKeyboardFocus();
+     autoCalibrator->start(8.0);
+ }
+ 
+--- a/Source/MainComponent.h
++++ b/Source/MainComponent.h
+@@ -63,6 +63,7 @@
+     bool simpleMode = true;
+ 
+     int lastBgVersion = -1;
++    unsigned int calibrationGeneration = 0;
+ 
+     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainComponent)
+ };
+--- a/Source/NodeCard.cpp
++++ b/Source/NodeCard.cpp
+@@ -718,6 +718,7 @@
+ 
+ void NodeCard::timerCallback()
+ {
++    engine.consumeVisualization();
+     if (helpHovered)
+     {
+         ++helpHoverFrames;
+--- a/Source/Nodes/LimiterNode.cpp
++++ b/Source/Nodes/LimiterNode.cpp
+@@ -13,14 +13,13 @@
+     {
+         float x = buffer[i];
+         float absX = std::abs(x);
+-        float targetGain = 1.0f;
+-        if (absX * gain > ceiling)
+-            targetGain = ceiling / juce::jmax(absX, 1e-9f);
++        // Constrain the new gain, not the output calculated with the old gain.
++        float targetGain = juce::jmin(1.0f, ceiling / juce::jmax(absX, 1e-9f));
+         if (targetGain < gain) gain = targetGain;
+         else                   gain = relCoef * gain + (1.0f - relCoef) * targetGain;
+         float reduc = 1.0f - gain;
+         maxReduc = juce::jmax(maxReduc, reduc);
+-        buffer[i] = x * gain;
++        buffer[i] = juce::jlimit(-ceiling, ceiling, x * gain);
+     }
+     auto smooth = [](float o, float n) { return n > o ? n : o * 0.85f + n * 0.15f; };
+     reduction.store(smooth(reduction.load(), juce::jlimit(0.0f, 1.0f, maxReduc)));
+--- a/Source/Nodes/MultiBandCompNode.cpp
++++ b/Source/Nodes/MultiBandCompNode.cpp
+@@ -14,6 +14,10 @@
+ 
+     midLowpass.prepare(spec);
+     highHighpass.prepare(spec);
++    lowPhaseCompensation.prepare(spec);
++    midLowpass.setType(juce::dsp::LinkwitzRileyFilterType::lowpass);
++    highHighpass.setType(juce::dsp::LinkwitzRileyFilterType::highpass);
++    lowPhaseCompensation.setType(juce::dsp::LinkwitzRileyFilterType::allpass);
+ 
+     lowBuf.setSize(1, blockSize, false, true, true);
+     midBuf.setSize(1, blockSize, false, true, true);
+@@ -31,6 +35,7 @@
+     restBandFilter.reset();
+     midLowpass.reset();
+     highHighpass.reset();
++    lowPhaseCompensation.reset();
+     lowEnv = midEnv = highEnv = 0.0f;
+     lastCrossLow = lastCrossHigh = -1.0;
+     for (auto& m : bandMeters) m.store(0.0f);
+@@ -38,7 +43,8 @@
+ 
+ void MultiBandCompNode::updateSplitters()
+ {
+-    float cl = juce::jlimit(80.0f, 800.0f, crossLowHz.get());
++    const float maxFrequency = static_cast<float>(sampleRate * 0.45);
++    float cl = juce::jlimit(1.0f, maxFrequency, crossLowHz.get());
+     if (std::abs(cl - lastCrossLow) > 0.5)
+     {
+         lastCrossLow = cl;
+@@ -46,14 +52,13 @@
+         restBandFilter.setCutoffFrequency(cl);
+     }
+ 
+-    float ch = juce::jlimit(1500.0f, 8000.0f, crossHighHz.get());
++    float ch = juce::jlimit(cl, maxFrequency, crossHighHz.get());
+     if (std::abs(ch - lastCrossHigh) > 0.5)
+     {
+         lastCrossHigh = ch;
+-        auto cLow = juce::dsp::IIR::Coefficients<float>::makeLowPass(sampleRate, ch, 0.707f);
+-        auto cHigh = juce::dsp::IIR::Coefficients<float>::makeHighPass(sampleRate, ch, 0.707f);
+-        *midLowpass.coefficients = *cLow;
+-        *highHighpass.coefficients = *cHigh;
++        midLowpass.setCutoffFrequency(ch);
++        highHighpass.setCutoffFrequency(ch);
++        lowPhaseCompensation.setCutoffFrequency(ch);
+     }
+ }
+ 
+@@ -134,6 +139,7 @@
+     {
+         juce::dsp::AudioBlock<float> lowBlock(lowBuf.getArrayOfWritePointers(), 1, (size_t) numSamples);
+         lowBandFilter.process(juce::dsp::ProcessContextReplacing<float>(lowBlock));
++        lowPhaseCompensation.process(juce::dsp::ProcessContextReplacing<float>(lowBlock));
+     }
+     // 剩余（中+高）：restBandFilter 固定 highpass
+     {
+--- a/Source/Nodes/MultiBandCompNode.h
++++ b/Source/Nodes/MultiBandCompNode.h
+@@ -32,9 +32,11 @@
+     juce::dsp::LinkwitzRileyFilter<float> lowBandFilter;   // 固定 lowpass
+     juce::dsp::LinkwitzRileyFilter<float> restBandFilter;  // 固定 highpass
+ 
+-    // 中高频分频（一级 IIR，因为频率固定，系数只在变化时更新）
+-    juce::dsp::IIR::Filter<float> midLowpass;
+-    juce::dsp::IIR::Filter<float> highHighpass;
++    // Use matching LR4 splits. The low branch needs the same all-pass phase
++    // response as the sum of the second split to preserve a flat recombination.
++    juce::dsp::LinkwitzRileyFilter<float> midLowpass;
++    juce::dsp::LinkwitzRileyFilter<float> highHighpass;
++    juce::dsp::LinkwitzRileyFilter<float> lowPhaseCompensation;
+ 
+     juce::AudioBuffer<float> lowBuf, midBuf, highBuf, tmpBuf;
+     float lowEnv = 0.0f, midEnv = 0.0f, highEnv = 0.0f;
+--- /dev/null
++++ b/Source/VisualizationData.h
+@@ -0,0 +1,132 @@
++#pragma once
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cmath>
++#include <cstddef>
++
++// One audio producer and one message-thread consumer. A full queue drops new
++// display data instead of overwriting a slot the consumer may still be reading.
++template <typename T, std::size_t Capacity>
++class DisplayQueue
++{
++public:
++    bool push(const T& value) noexcept
++    {
++        const auto write = writeIndex.load(std::memory_order_relaxed);
++        const auto next = (write + 1) % Capacity;
++        if (next == readIndex.load(std::memory_order_acquire)) return false;
++        slots[write] = value;
++        writeIndex.store(next, std::memory_order_release);
++        return true;
++    }
++
++    bool pop(T& value) noexcept
++    {
++        const auto read = readIndex.load(std::memory_order_relaxed);
++        if (read == writeIndex.load(std::memory_order_acquire)) return false;
++        value = slots[read];
++        readIndex.store((read + 1) % Capacity, std::memory_order_release);
++        return true;
++    }
++
++private:
++    static_assert(Capacity > 1, "A queue needs at least two slots");
++    static_assert(std::atomic<std::size_t>::is_always_lock_free,
++                  "Display queue indices must be lock-free on the audio thread");
++    std::array<T, Capacity> slots {};
++    alignas(64) std::atomic<std::size_t> writeIndex { 0 };
++    alignas(64) std::atomic<std::size_t> readIndex { 0 };
++};
++
++class VisualizationData
++{
++public:
++    static constexpr int waveSize = 131072;
++    static constexpr int bands = 96;
++    static constexpr int historySize = 480;
++    using Spectrum = std::array<float, bands>;
++
++    // Audio-thread methods: bounded copies, no allocation, no waiting.
++    void pushWave(const float* samples, int count) noexcept
++    {
++        WavePacket packet;
++        while (count > 0)
++        {
++            packet.count = std::min(count, waveChunkSize);
++            std::copy_n(samples, packet.count, packet.samples.begin());
++            if (!waveQueue.push(packet)) return;
++            samples += packet.count;
++            count -= packet.count;
++        }
++    }
++
++    void pushSpectrum(const Spectrum& frame) noexcept { spectrumQueue.push(frame); }
++
++    // Call only on the message thread before painting. All getters below also
++    // belong to that thread, so no UI history array is shared with the producer.
++    void consume() noexcept
++    {
++        WavePacket packet;
++        for (int n = 0; n < waveQueueSize && waveQueue.pop(packet); ++n)
++            for (int i = 0; i < packet.count; ++i)
++            {
++                const auto slot = static_cast<std::size_t>(waveWritePos);
++                const float sample = packet.samples[static_cast<std::size_t>(i)];
++                wave[slot] = sample;
++                // Preserve the existing display smoothing; it is now UI-owned.
++                const float previous = smoothedWave[slot];
++                const float coefficient = std::abs(sample) > std::abs(previous) ? 0.55f : 0.08f;
++                smoothedWave[slot] = previous + (sample - previous) * coefficient;
++                waveWritePos = (waveWritePos + 1) % waveSize;
++            }
++
++        Spectrum frame;
++        for (int n = 0; n < spectrumQueueSize && spectrumQueue.pop(frame); ++n)
++        {
++            spectrum = frame;
++            history[static_cast<std::size_t>(spectrumWritePos)] = frame;
++            spectrumWritePos = (spectrumWritePos + 1) % historySize;
++        }
++    }
++
++    float getSpectrumBand(int index) const noexcept
++    {
++        return index >= 0 && index < bands ? spectrum[static_cast<std::size_t>(index)] : 0.0f;
++    }
++    float getSpectrumHistory(int time, int band) const noexcept
++    {
++        if (band < 0 || band >= bands) return 0.0f;
++        const auto row = static_cast<std::size_t>(std::clamp(time, 0, historySize - 1));
++        return history[row][static_cast<std::size_t>(band)];
++    }
++    float getWaveSample(int index) const noexcept
++    {
++        return index >= 0 && index < waveSize ? wave[static_cast<std::size_t>(index)] : 0.0f;
++    }
++    float getSmoothedWaveSample(int index) const noexcept
++    {
++        return index >= 0 && index < waveSize ? smoothedWave[static_cast<std::size_t>(index)] : 0.0f;
++    }
++    int getWaveWritePos() const noexcept { return waveWritePos; }
++    int getSpectrumWritePos() const noexcept { return spectrumWritePos; }
++
++private:
++    static constexpr int waveChunkSize = 256;
++    static constexpr int waveQueueSize = 512;
++    static constexpr int spectrumQueueSize = 128;
++    struct WavePacket
++    {
++        std::array<float, waveChunkSize> samples {};
++        int count = 0;
++    };
++    DisplayQueue<WavePacket, waveQueueSize> waveQueue;
++    DisplayQueue<Spectrum, spectrumQueueSize> spectrumQueue;
++
++    std::array<float, waveSize> wave {};
++    std::array<float, waveSize> smoothedWave {};
++    Spectrum spectrum {};
++    std::array<Spectrum, historySize> history {};
++    int waveWritePos = 0;
++    int spectrumWritePos = 0;
++};
+--- /dev/null
++++ b/Tests/DisplayQueueTests.cpp
+@@ -0,0 +1,79 @@
++#include "VisualizationData.h"
++#include <cstdlib>
++#include <iostream>
++#include <memory>
++#include <thread>
++
++static void require(bool condition)
++{
++    if (!condition) { std::cerr << "Display queue assertion failed\n"; std::abort(); }
++}
++
++int main()
++{
++    DisplayQueue<int, 4> small;
++    require(small.push(1) && small.push(2) && small.push(3));
++    require(!small.push(4));
++    int value = 0;
++    for (int expected = 1; expected <= 3; ++expected)
++        require(small.pop(value) && value == expected);
++    require(!small.pop(value));
++    require(small.push(5) && small.pop(value) && value == 5);
++
++    // Saturate the actual producer queues while the UI is paused, then recover.
++    auto display = std::make_unique<VisualizationData>();
++    std::array<float, 256> wave;
++    wave.fill(0.25f);
++    VisualizationData::Spectrum spectrum;
++    spectrum.fill(0.5f);
++    for (int i = 0; i < 10000; ++i) { display->pushWave(wave.data(), 256); display->pushSpectrum(spectrum); }
++    display->consume();
++    require(display->getWaveWritePos() == 511 * 256);
++    require(display->getWaveSample(0) == 0.25f);
++    require(display->getSpectrumBand(0) == 0.5f);
++    wave.fill(0.75f);
++    display->pushWave(wave.data(), 256);
++    display->consume();
++    require(display->getWaveWritePos() == 0);
++    require(display->getWaveSample(VisualizationData::waveSize - 1) == 0.75f);
++
++    // Verify the ownership hand-off under contention, including wraparound.
++    DisplayQueue<VisualizationData::Spectrum, 8> queue;
++    constexpr int frames = 200000;
++    std::thread producer([&] {
++        VisualizationData::Spectrum frame;
++        for (int i = 1; i <= frames; ++i)
++        {
++            frame.fill(static_cast<float>(i));
++            while (!queue.push(frame)) std::this_thread::yield();
++        }
++    });
++    VisualizationData::Spectrum frame;
++    for (int expected = 1; expected <= frames; ++expected)
++    {
++        while (!queue.pop(frame)) std::this_thread::yield();
++        for (float item : frame) require(item == static_cast<float>(expected));
++    }
++    producer.join();
++
++    // Exercise the actual transport and UI-owned histories concurrently.
++    std::atomic<bool> done { false };
++    std::thread audio([&] {
++        for (int i = 0; i < 50000; ++i)
++        {
++            display->pushWave(wave.data(), 256);
++            display->pushSpectrum(spectrum);
++        }
++        done.store(true);
++    });
++    do
++    {
++        display->consume();
++        for (int i = 0; i < VisualizationData::bands; ++i)
++            require(display->getSpectrumBand(i) == 0.5f);
++        require(std::isfinite(display->getSmoothedWaveSample(display->getWaveWritePos())));
++    } while (!done.load());
++    audio.join();
++    display->consume();
++    std::cout << "PASS: queue full/recovery, 200000 ordered frames, concurrent visualization histories\n";
++}
+--- /dev/null
++++ b/Tests/PriorityFixes.cpp
+@@ -0,0 +1,237 @@
++#include "AudioEngine.h"
++#include "AutoCalibrator.h"
++#include "CalibrationOverlay.h"
++#include "Nodes/MultiBandCompNode.h"
++#include "Nodes/LimiterNode.h"
++#include <juce_gui_basics/juce_gui_basics.h>
++#include <algorithm>
++#include <cmath>
++#include <iostream>
++#include <limits>
++#include <memory>
++#include <stdexcept>
++#include <vector>
++
++static void require(bool condition, const char* message)
++{
++    if (!condition) throw std::runtime_error(message);
++}
++
++class TestDevice : public juce::AudioIODevice
++{
++public:
++    TestDevice() : AudioIODevice("Offline test device", "Test") {}
++    double rate = 48000.0;
++    int block = 512;
++    bool inputEnabled = true, outputEnabled = true;
++    juce::StringArray getOutputChannelNames() override { return { "out" }; }
++    juce::StringArray getInputChannelNames() override { return { "in" }; }
++    juce::Array<double> getAvailableSampleRates() override { return { rate }; }
++    juce::Array<int> getAvailableBufferSizes() override { return { block }; }
++    int getDefaultBufferSize() override { return block; }
++    juce::String open(const juce::BigInteger&, const juce::BigInteger&, double, int) override { return {}; }
++    void close() override {}
++    bool isOpen() override { return true; }
++    void start(juce::AudioIODeviceCallback*) override {}
++    void stop() override {}
++    bool isPlaying() override { return true; }
++    juce::String getLastError() override { return {}; }
++    int getCurrentBufferSizeSamples() override { return block; }
++    double getCurrentSampleRate() override { return rate; }
++    int getCurrentBitDepth() override { return 32; }
++    juce::BigInteger getActiveOutputChannels() const override { return juce::BigInteger(outputEnabled ? 1 : 0); }
++    juce::BigInteger getActiveInputChannels() const override { return juce::BigInteger(inputEnabled ? 1 : 0); }
++    int getOutputLatencyInSamples() override { return 0; }
++    int getInputLatencyInSamples() override { return 0; }
++};
++
++static void process(AudioEngine& engine, const std::vector<float>& input, std::vector<float>& output)
++{
++    output.resize(input.size());
++    const float* in[] = { input.data() };
++    float* out[] = { output.data() };
++    engine.audioDeviceIOCallbackWithContext(in, 1, out, 1, static_cast<int>(input.size()), {});
++}
++
++static void pumpTimer()
++{
++    juce::MessageManager::getInstance()->runDispatchLoopUntil(60);
++}
++
++static void testCrossovers()
++{
++    double worstDb = 0;
++    int cases = 0;
++    for (double sr : { 44100.0, 48000.0, 96000.0 })
++        for (float low : { 100.0f, 300.0f, 800.0f })
++            for (float high : { 1500.0f, 3000.0f, 6000.0f })
++            {
++                // An impulse response tests the actual node, phase compensation,
++                // JUCE filters and block processing together (not just formulas).
++                MultiBandCompNode node;
++                node.lowAmount.set(0); node.midAmount.set(0); node.highAmount.set(0);
++                node.crossLowHz.set(low); node.crossHighHz.set(high);
++                node.prepare(sr, 257);
++                constexpr int count = 65536;
++                std::vector<float> impulse(count, 0);
++                impulse[0] = 1;
++                for (int pos = 0; pos < count; pos += 257)
++                    node.process(impulse.data() + pos, std::min(257, count - pos));
++                juce::dsp::FFT fft(16);
++                std::vector<float> spectrum(count * 2, 0);
++                std::copy(impulse.begin(), impulse.end(), spectrum.begin());
++                fft.performFrequencyOnlyForwardTransform(spectrum.data(), true);
++                for (int i = 1; i < static_cast<int>(count * .45); ++i)
++                {
++                    const double db = std::abs(20 * std::log10(std::max(1.0e-12f, spectrum[static_cast<size_t>(i)])));
++                    worstDb = std::max(worstDb, db);
++                    require(db < 0.01, "Multi-band unity sum is not flat");
++                }
++                ++cases;
++            }
++    std::cout << "PASS: " << cases << " actual multi-band impulse responses; worst deviation=" << worstDb << " dB\n";
++}
++
++static void testFinalOutput()
++{
++    auto engine = std::make_unique<AudioEngine>(false);
++    TestDevice device;
++    engine->audioDeviceAboutToStart(&device);
++    LimiterNode* limiter = nullptr;
++    for (int i = 0; i < engine->getNumNodes(); ++i)
++    {
++        auto* node = engine->getNode(i);
++        node->setBypassed(true);
++        if (node->getName() == "Limiter") limiter = dynamic_cast<LimiterNode*>(node);
++        if (node->getName() == "Output Gain")
++        {
++            node->setBypassed(false);
++            for (auto p : node->getParameters()) p.param->set(12);
++        }
++    }
++    require(limiter != nullptr && engine->getNode(engine->getNumNodes()-1) == limiter, "Limiter is not last");
++    limiter->setBypassed(false);
++    std::vector<float> input(512), output;
++    double maxExcess = 0;
++    for (double sr : { 44100.0, 48000.0, 96000.0 })
++        for (float ceiling : { -12.0f, -2.0f, 0.0f })
++            for (float release : { 5.0f, 50.0f, 500.0f })
++            {
++                device.rate = sr;
++                engine->audioDeviceAboutToStart(&device);
++                limiter->thresholdDb.set(ceiling);
++                limiter->releaseMs.set(release);
++                const float upper = juce::Decibels::decibelsToGain(ceiling);
++                for (int block = 0; block < 8; ++block)
++                {
++                    for (size_t i = 0; i < input.size(); ++i)
++                        input[i] = block < 2 ? 1.0f : 2.0f * std::sin(static_cast<float>(i + block * 512) * .137f);
++                    process(*engine, input, output);
++                    for (float sample : output)
++                    {
++                        maxExcess = std::max(maxExcess, static_cast<double>(std::abs(sample)-upper));
++                        require(std::isfinite(sample) && std::abs(sample) <= upper, "Final output exceeds configured ceiling");
++                    }
++                }
++            }
++    // Keep the band-limit enabled as well to exercise the actual full tail.
++    for (int i = 0; i < engine->getNumNodes(); ++i)
++        if (engine->getNode(i)->getName() == "Band-Limit") engine->getNode(i)->setBypassed(false);
++    limiter->thresholdDb.set(-2);
++    input.assign(512, 0.9f);
++    process(*engine, input, output);
++    for (float sample : output) require(std::abs(sample) <= juce::Decibels::decibelsToGain(-2.0f), "Filtered tail exceeds ceiling");
++    limiter->setBypassed(true);
++    process(*engine, input, output);
++    for (float sample : output) require(std::isfinite(sample) && std::abs(sample) <= 1, "Module bypass defeats safety");
++    engine->setBypass(true);
++    input = { -100.0f, 100.0f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN() };
++    process(*engine, input, output);
++    require(output[0] == -1 && output[1] == 1 && output[2] == 0 && output[3] == 0, "Global bypass defeats safety");
++    std::cout << "PASS: final output with +12 dB gain, 27 rate/ceiling/release combinations, bypass and non-finite input; excess=" << maxExcess << "\n";
++}
++
++static void testCalibration()
++{
++    auto engine = std::make_unique<AudioEngine>(false);
++    TestDevice device;
++    double now = 0;
++    AutoCalibrator calibration(*engine, [&] { return now; });
++    int finishes = 0;
++    auto result = AutoCalibrator::Result::succeeded;
++    calibration.onFinished = [&](AutoCalibrator::Result value, const juce::String& message) {
++        ++finishes; result = value; require(message.isNotEmpty(), "Missing calibration feedback");
++    };
++    auto* inputGain = engine->getNode(0)->getParameters()[0].param;
++    inputGain->set(-7);
++
++    calibration.start();
++    require(!calibration.isRunning() && result == AutoCalibrator::Result::failed, "No device was accepted");
++    device.inputEnabled = false;
++    engine->audioDeviceAboutToStart(&device);
++    calibration.start();
++    require(!calibration.isRunning() && result == AutoCalibrator::Result::failed, "No input channel was accepted");
++    device.inputEnabled = true; device.outputEnabled = false;
++    engine->audioDeviceAboutToStart(&device);
++    calibration.start();
++    require(!calibration.isRunning() && result == AutoCalibrator::Result::failed, "No output channel was accepted");
++    device.outputEnabled = true;
++    engine->audioDeviceAboutToStart(&device);
++    calibration.start(); now += 2001; pumpTimer();
++    require(!calibration.isRunning() && result == AutoCalibrator::Result::failed, "No-data timeout did not fire");
++
++    calibration.start(); engine->audioDeviceStopped(); pumpTimer();
++    require(!calibration.isRunning() && result == AutoCalibrator::Result::failed, "Disconnect did not fail");
++    engine->audioDeviceAboutToStart(&device);
++    calibration.start(); engine->audioDeviceError("test error"); pumpTimer();
++    require(!calibration.isRunning() && result == AutoCalibrator::Result::failed, "Device error did not fail");
++    engine->audioDeviceAboutToStart(&device);
++    calibration.start(); engine->stopCapture(); pumpTimer();
++    require(!calibration.isRunning() && result == AutoCalibrator::Result::failed, "Partial capture was treated as success");
++
++    calibration.start();
++    CalibrationOverlay overlay;
++    overlay.setSize(1000, 600);
++    overlay.onCancel = [&] { calibration.cancel(); };
++    overlay.setProgress(.5f);
++    overlay.setStage(0, juce::String::fromUTF8(u8"正在采集音频…请正常说话"));
++    const auto snapshot = overlay.createComponentSnapshot(overlay.getLocalBounds());
++    auto png = juce::File::getCurrentWorkingDirectory().getChildFile("calibration-overlay.png").createOutputStream();
++    require(png != nullptr && juce::PNGImageFormat().writeImageToStream(snapshot, *png), "Overlay snapshot failed");
++    require(overlay.keyPressed(juce::KeyPress(juce::KeyPress::escapeKey)), "Esc was not handled");
++    require(!calibration.isRunning() && !engine->isCapturing() && result == AutoCalibrator::Result::cancelled, "Esc cancellation failed");
++    const int afterCancel = finishes;
++    pumpTimer(); require(finishes == afterCancel, "Cancellation finished more than once");
++
++    calibration.start();
++    auto* button = dynamic_cast<juce::TextButton*>(overlay.getChildComponent(0));
++    require(button != nullptr && button->isVisible(), "Cancel button missing");
++    button->onClick();
++    require(!calibration.isRunning() && result == AutoCalibrator::Result::cancelled, "Button cancellation failed");
++    require(inputGain->get() == -7, "Failed/cancelled calibration changed parameters");
++
++    // Stalled and slowly arriving data are separate timeout cases.
++    std::vector<float> input(512, .1f), output;
++    calibration.start(0.2);
++    now += 1500; process(*engine, input, output); pumpTimer();
++    require(calibration.isRunning(), "Capture failed before its deadline");
++    now += 1800; process(*engine, input, output); pumpTimer();
++    require(!calibration.isRunning() && result == AutoCalibrator::Result::failed, "Overall capture deadline did not fire");
++
++    calibration.start(.1);
++    for (int i = 0; i < 10; ++i) process(*engine, input, output);
++    pumpTimer();
++    require(!calibration.isRunning() && result == AutoCalibrator::Result::succeeded, "Complete capture did not succeed");
++    require(engine->getCapturedSamples() == 4800, "Capture did not stop at exact target");
++    const int afterSuccess = finishes;
++    pumpTimer(); require(finishes == afterSuccess, "Success finished more than once");
++    std::cout << "PASS: calibration no-device/channels, stall/deadline, disconnect/error, partial capture, Esc/button cancel, restart/success (" << finishes << " results)\n";
++}
++
++int main()
++{
++    juce::ScopedJuceInitialiser_GUI initialiser;
++    try { testCrossovers(); testFinalOutput(); testCalibration(); }
++    catch (const std::exception& e) { std::cerr << "FAIL: " << e.what() << '\n'; return 1; }
++    std::cout << "All priority-fix regression tests passed.\n";
++}

@@ -1,0 +1,27 @@
+Targeted audit check output, 2026-10-17
+Command: python3 audit/run_checks.py
+Exit code: 0
+Scope: isolated verbatim DSP methods with minimal math shims; analytical crossover model;
+       FFT ingestion simulation; toolbar arithmetic. Not a full JUCE application test.
+
+Limiter ceiling=0.251188636, sample1=0.251188636, sample2=0.254302204, excess=0.107003 dB
+Gate gain at 5 ms after onset: 0.087057
+Gate gain at 10 ms after onset: 0.116987
+Gate gain at 50 ms after onset: 0.323674
+Gate gain at 150 ms after onset: 0.652763
+Multi-band sum with amounts=0, makeup=0, crossovers=300/3000 Hz:
+  1000 Hz: -1.049 dB
+  1500 Hz: -2.697 dB
+  2000 Hz: -5.770 dB
+  2500 Hz: -11.831 dB
+  2800 Hz: -20.041 dB
+  3000 Hz: -80.447 dB
+FFT ingestion per callback pattern:
+  block=256: accepted=25600/25600, discarded=0, frames=25
+  block=480: accepted=34272/48000, discarded=13728, frames=33
+  block=512: accepted=51200/51200, discarded=0, frames=50
+  block=768: accepted=51200/76800, discarded=25600, frames=50
+  block=2048: accepted=102400/204800, discarded=102400, frames=100
+Toolbar minimum requirement (76px mode buttons): 1386px; default=1360px, allowed minimum=1000px
+Macro endpoints: compressor 100% => threshold=0 dB, ratio=20, makeup=24 dB;
+  de-esser 100% => threshold=0 dB, amount=100% (no reduction for detector envelope below 0 dBFS).
