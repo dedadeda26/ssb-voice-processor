@@ -1,10 +1,7 @@
-# Local audit tooling, caches and original archives
+# Local archives / audit dumps
 /audit/
 /*.rar
 /*.zip
-/??????.md
-/?????????.md
-/P2???????.md
 
 # Generated builds and platform metadata
 **/build/
